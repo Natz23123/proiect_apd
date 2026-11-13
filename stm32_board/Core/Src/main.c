@@ -18,12 +18,12 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <stdio.h>
-#include "VL53L1X_api.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdint.h>
+#include <stdio.h>
+#include "VL53L1X_api.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,9 +35,9 @@
 /* USER CODE BEGIN PD */
 
 // ADRESELE I2C ALE SENZORILOR VL53L1X 
-#define ADDR_SHIELD 0x56   // senzor centru (adresa noua)
+#define ADDR_SHIELD 0x56   // senzor centru 
 #define ADDR_L      0x54   // senzor stanga
-#define ADDR_R      0x58   // senzor dreapta (vezi nota de mai jos)
+#define ADDR_R      0x58   // senzor dreapta 
 // ADRESELE EXPANDERELOR/ SHIELD
 #define EXP_LR      0x86   // expander U21: stanga + dreapta
 #define EXP_C       0x84   // expander U19: centru
@@ -97,44 +97,97 @@ typedef enum { G_NONE, G_NEXT, G_PREV} gesture_t;
 
 // CONSTANTE PENTRU DETECTAREA GESTURILOR
 #define GEST_MS 800
-#define DIST_TH 400
+#define DIST_TH 700
 #define LOST_MS 500 
 #define COOLDOWN_MS 700 // PAUZA DUPA GEST
+#define SWIPE_MIN_MS 60   // sub această durată e apropiere, nu swipe
+
+// variabila globala pentru a bloca detectarea gesturilor in timpul unui zoom
+static uint32_t block_until = 0;
 
 // FUNCTIE AJUTATOARE PENTRU DETECTAREA GESTURILOR
 static gesture_t detect_gesture(const uint16_t distances[3], uint32_t now){
   static uint32_t t[3] = {0, 0, 0}; // TIMPURILE PENTRU FIECARE SENZOR (STANGA, CENTRU, DREAPTA)
   static uint32_t last_seen = 0; // ULTIMA DATA CAND A FOST VAZUT UN OBIECT
-  static uint32_t block_until = 0; // COOLDOWN PENTRU A NU DETECTA GESTURI MULTIPLE
+  static uint8_t wait_release = 0; 
 
   if (now < block_until) return G_NONE; // DACA SUNTEM IN COOLDOWN, NU DETECTAM GESTURI
 
+  uint8_t any = 0;
   for (int k = 0; k < 3; k++){
     if (distances[k] > 0 && distances[k] < DIST_TH){ // VERIFICARE DISTANTA < THRESHOLD
-      if (t[k] == 0) t[k] = now; // DACA NU A FOST VAZUT INAINTE, SETEAZA TIMPUL CURENT
+      any = 1;
       last_seen = now;
+      if (!wait_release && t[k] == 0) t[k] = now; // DACA NU A FOST ELIBERAT, NU RESETEAZA TIMPUL
     }
+  }
+
+  if (wait_release){
+    if (!any && now - last_seen > 150) wait_release = 0;
+    return G_NONE;
   }
 
   gesture_t gesture = G_NONE;
   if (t[0] && t[1] && t[2]){
-    if (t[0] < t[1] && t[1] < t[2] && t[2] - t[0] < GEST_MS){
-      gesture = G_NEXT; 
+    if (t[0] < t[1] && t[1] < t[2]){
+      uint32_t span = t[2] - t[0];
+      if (span >= SWIPE_MIN_MS && span < GEST_MS) gesture = G_NEXT;
     }
-    else if (t[2] < t[1] && t[1] < t[0] && t[0] - t[2] < GEST_MS){
-      gesture = G_PREV;
+    else if (t[2] < t[1] && t[1] < t[0]){
+      uint32_t span = t[0] - t[2];
+      if (span >= SWIPE_MIN_MS && span < GEST_MS) gesture = G_PREV;
     }
     t[0] = t[1] = t[2] = 0;
     if (gesture != G_NONE) block_until = now + COOLDOWN_MS;
+    else wait_release = 1;
   }
   else if (last_seen && now - last_seen > LOST_MS){
     t[0] = t[1] = t[2] = 0;
-    last_seen = 0; // RESETARE TIMPURI DACA OBIECTUL A FOST PIERDUT
+    last_seen = 0;
   }
   return gesture;
 }
 
+#define ZOOM_DELTA 80 // 
 
+typedef enum { ZOOM_NONE, ZOOM_IN, ZOOM_OUT } zoom_t;
+
+// FUNCTIE ZOOM IN/ ZOOM OUT PENTRU AFISAREA IN UART
+static zoom_t detect_zoom(const uint16_t distances[3], uint32_t now){
+  static uint16_t last_distances[3] = {0, 0, 0};
+  static uint16_t start_c = 0;
+  static uint8_t active = 0;
+  static uint32_t zoom_block = 0;
+
+  for (int k=0; k<3; k++){
+    if (distances[k]) last_distances[k] = distances[k];
+  }
+  if (now < zoom_block || now < block_until){
+    active = 0;                 // ca să reînceapă curat după pauză
+    return ZOOM_NONE;
+  }
+
+  uint8_t all = 1;
+  for (int k=0; k<3; k++){
+    if (last_distances[k] == 0 || last_distances[k] >= DIST_TH) all = 0;
+  }
+
+  if(!all){
+    active = 0;
+    start_c = 0;
+    return ZOOM_NONE;
+  }
+  if(!active){
+    active = 1;
+    start_c = last_distances[1];
+    return ZOOM_NONE;
+  }
+
+  int diff = (int)last_distances[1] - (int)start_c;
+  if (diff <= -ZOOM_DELTA) { active = 0; zoom_block = now + COOLDOWN_MS; return ZOOM_IN; }
+  if (diff >=  ZOOM_DELTA) { active = 0; zoom_block = now + COOLDOWN_MS; return ZOOM_OUT; }
+  return ZOOM_NONE;
+}
 
 /* USER CODE END 0 */
 
@@ -240,6 +293,11 @@ int main(void)
     gesture_t gesture = detect_gesture(distance, HAL_GetTick());
     if (gesture == G_NEXT) HAL_UART_Transmit(&huart2, (uint8_t*)"NEXT\r\n", 6, 100);
     if (gesture == G_PREV) HAL_UART_Transmit(&huart2, (uint8_t*)"PREV\r\n", 6, 100);
+    if (gesture == G_NONE) {
+        zoom_t z = detect_zoom(distance, HAL_GetTick());
+        if (z == ZOOM_IN)  HAL_UART_Transmit(&huart2, (uint8_t*)"ZOOM_IN\r\n", 9, 100);
+        if (z == ZOOM_OUT) HAL_UART_Transmit(&huart2, (uint8_t*)"ZOOM_OUT\r\n", 10, 100);
+    }
     HAL_Delay(5);
 
     // DEBUG: AFISEAZA DISTANTELE IN UART DACA ORICARE DINTRE ELE ESTE MAI MIC DE DIST_TH
