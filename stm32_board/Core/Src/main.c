@@ -33,15 +33,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+// ADRESELE I2C ALE SENZORILOR VL53L1X 
 #define ADDR_SHIELD 0x56   // senzor centru (adresa noua)
 #define ADDR_L      0x54   // senzor stanga
 #define ADDR_R      0x58   // senzor dreapta (vezi nota de mai jos)
-
+// ADRESELE EXPANDERELOR/ SHIELD
 #define EXP_LR      0x86   // expander U21: stanga + dreapta
 #define EXP_C       0x84   // expander U19: centru
 #define EXP_GPSR    0x12
 #define EXP_GPDR    0x14
-
+// PINII XSHUT DE PE EXPANDERE
 #define XSHUT_L     (1u << 14)   // pe EXP_LR
 #define XSHUT_R     (1u << 15)   // pe EXP_LR
 #define XSHUT_C     (1u << 15)   // pe EXP_C
@@ -74,16 +76,65 @@ static void MX_USART2_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// FUNCTIE AJUTATOARE PENTRU SETAREA/RESETAREA BITILOR DIN REGISTRUL "reg" DE PE EXPANDERUL "exp"
 static void exp_bits(uint8_t exp, uint8_t reg, uint16_t mask, uint8_t set)
 {
-    uint8_t b[2];
+    uint8_t b[2]; // BUFFER PENTRU CITIREA SI SCRIEREA PE I2C
     HAL_I2C_Mem_Read(&hi2c1, exp, reg, I2C_MEMADD_SIZE_8BIT, b, 2, 100);
+    // ^ CITIREA A 2 BYTES DIN REGISTRUL "reg" DE PE EXPANDERUL "exp"
     uint16_t v = b[0] | (b[1] << 8);
-    if (set) v |= mask; else v &= ~mask;
+    // ^ COMBINAREA CELOR 2 BYTES INTR-UN SINGUR VALOARE DE 16 BITS
+    if (set) v |= mask; else v &= ~mask; // SETAREA SAU RESETAREA BITILOR DIN "mask" IN FUNCTIE DE "set"
     b[0] = v & 0xFF;
     b[1] = v >> 8;
+    // ^ IMPARTIREA VALORII DE 16 BITS INAPOI IN 2 BYTES PENTRU SCRIEREA IN REGISTRUL "reg"
     HAL_I2C_Mem_Write(&hi2c1, exp, reg, I2C_MEMADD_SIZE_8BIT, b, 2, 100);
+    // ^ SCRIERE EFECTIVA A CELOR 2 BYTES PE REGISTRUL "reg" DE PE EXPANDERUL "exp"
 }
+
+// ENUMERARE A TIPURILOR DE GEST
+typedef enum { G_NONE, G_NEXT, G_PREV} gesture_t;
+
+// CONSTANTE PENTRU DETECTAREA GESTURILOR
+#define GEST_MS 800
+#define DIST_TH 400
+#define LOST_MS 500 
+#define COOLDOWN_MS 700 // PAUZA DUPA GEST
+
+// FUNCTIE AJUTATOARE PENTRU DETECTAREA GESTURILOR
+static gesture_t detect_gesture(const uint16_t distances[3], uint32_t now){
+  static uint32_t t[3] = {0, 0, 0}; // TIMPURILE PENTRU FIECARE SENZOR (STANGA, CENTRU, DREAPTA)
+  static uint32_t last_seen = 0; // ULTIMA DATA CAND A FOST VAZUT UN OBIECT
+  static uint32_t block_until = 0; // COOLDOWN PENTRU A NU DETECTA GESTURI MULTIPLE
+
+  if (now < block_until) return G_NONE; // DACA SUNTEM IN COOLDOWN, NU DETECTAM GESTURI
+
+  for (int k = 0; k < 3; k++){
+    if (distances[k] > 0 && distances[k] < DIST_TH){ // VERIFICARE DISTANTA < THRESHOLD
+      if (t[k] == 0) t[k] = now; // DACA NU A FOST VAZUT INAINTE, SETEAZA TIMPUL CURENT
+      last_seen = now;
+    }
+  }
+
+  gesture_t gesture = G_NONE;
+  if (t[0] && t[1] && t[2]){
+    if (t[0] < t[1] && t[1] < t[2] && t[2] - t[0] < GEST_MS){
+      gesture = G_NEXT; 
+    }
+    else if (t[2] < t[1] && t[1] < t[0] && t[0] - t[2] < GEST_MS){
+      gesture = G_PREV;
+    }
+    t[0] = t[1] = t[2] = 0;
+    if (gesture != G_NONE) block_until = now + COOLDOWN_MS;
+  }
+  else if (last_seen && now - last_seen > LOST_MS){
+    t[0] = t[1] = t[2] = 0;
+    last_seen = 0; // RESETARE TIMPURI DACA OBIECTUL A FOST PIERDUT
+  }
+  return gesture;
+}
+
+
 
 /* USER CODE END 0 */
 
@@ -120,28 +171,29 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   
-    char msg[64];
-  int n;
-  uint8_t booted;
+  // VARIABILE PENTRU AFISAREA IN UART
+  char msg[64]; // BUFFER PENTRU MESAJELE DE DEBUG
+  int n; // NUMARUL DE CARACTERE DIN MESAJELE DE DEBUG
+  uint8_t booted; // VARIABILA PENTRU VERIFICAREA STARI DE BOOT A SENZORILOR
 
-  // 1. toti trei ies ca iesiri si adorm
+  // 1. TREZESTE TOTI SENZORII (XSHUT=1) SI ASTEPTA 10 ms
   exp_bits(EXP_LR, EXP_GPDR, XSHUT_L | XSHUT_R, 1);
   exp_bits(EXP_C,  EXP_GPDR, XSHUT_C, 1);
   exp_bits(EXP_LR, EXP_GPSR, XSHUT_L | XSHUT_R, 0);
   exp_bits(EXP_C,  EXP_GPSR, XSHUT_C, 0);
   HAL_Delay(10);
 
-  // 2. centru: trezeste, schimba adresa
+  // 2. CENTRU: TREZESTE, SCHIMBA ADRESA I2C
   exp_bits(EXP_C, EXP_GPSR, XSHUT_C, 1);
   HAL_Delay(10);
   VL53L1X_SetI2CAddress(0x52, ADDR_SHIELD);
 
-  // 3. stanga: trezeste, schimba adresa
+  // 3. STANGA: TREZESTE, SCHIMBA ADRESA I2C
   exp_bits(EXP_LR, EXP_GPSR, XSHUT_L, 1);
   HAL_Delay(10);
   VL53L1X_SetI2CAddress(0x52, ADDR_L);
 
-  // 4. dreapta: trezeste, schimba adresa
+  // 4. DREAPTA: TREZESTE, SCHIMBA ADRESA I2C
   exp_bits(EXP_LR, EXP_GPSR, XSHUT_R, 1);
   HAL_Delay(10);
   VL53L1X_SetI2CAddress(0x52, ADDR_R);
@@ -155,8 +207,11 @@ int main(void)
           HAL_Delay(2);
       }
       if (booted) {
-          VL53L1X_SensorInit(addrs[k]);
-          VL53L1X_StartRanging(addrs[k]);
+          VL53L1X_SensorInit(addrs[k]); // INITIALIZARE SENZOR
+          VL53L1X_SetDistanceMode(addrs[k], 1); // MOD DE DISTANTA 1 ~1-2 m
+          VL53L1X_SetTimingBudgetInMs(addrs[k], 20); // 20 ms PETRECUTE PER MASURATOARE
+          VL53L1X_SetInterMeasurementInMs(addrs[k], 25); // MASURATOARE ODATA LA 25 ms
+          VL53L1X_StartRanging(addrs[k]); // PORNIRE MASURATORI
       }
       n = snprintf(msg, sizeof(msg), "Senzor 0x%02X: %s\r\n", addrs[k], booted ? "OK" : "nu a pornit");
       HAL_UART_Transmit(&huart2, (uint8_t*)msg, n, 100);
@@ -170,21 +225,30 @@ int main(void)
   {
     /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
-    uint16_t d[3] = {0, 0, 0};
-    uint8_t addrs3[3] = {ADDR_SHIELD, ADDR_L, ADDR_R};
-    uint8_t ready;
+    uint16_t distance[3] = {0, 0, 0}; // MATRICEA DE DISTANTA
+    uint8_t addrs3[3] = {ADDR_L, ADDR_SHIELD, ADDR_R}; // ADRESE IN ORDINE STANGA, CENTRU, DREAPTA
+    uint8_t ready; // VARIABILA PENTRU VERIFICAREA STARI
     char out[64];
 
     for (int k = 0; k < 3; k++) {
         ready = 0;
-        if (VL53L1X_CheckForDataReady(addrs3[k], &ready) == 0 && ready) {
-            VL53L1X_GetDistance(addrs3[k], &d[k]);
-            VL53L1X_ClearInterrupt(addrs3[k]);
+        if (VL53L1X_CheckForDataReady(addrs3[k], &ready) == 0 && ready) { // VERIFICA DACA DATELE SUNT GATA
+            VL53L1X_GetDistance(addrs3[k], &distance[k]); // IA DISTANTA
+            VL53L1X_ClearInterrupt(addrs3[k]); // CURATA INTERRUPTUL PENTRU A PERMITE URMATOAREA MASURARE
         }
     }
-    int m = snprintf(out, sizeof(out), "C: %u | L: %u | R: %u mm\r\n", d[0], d[1], d[2]);
-    HAL_UART_Transmit(&huart2, (uint8_t*)out, m, 100);
-    HAL_Delay(100);
+    gesture_t gesture = detect_gesture(distance, HAL_GetTick());
+    if (gesture == G_NEXT) HAL_UART_Transmit(&huart2, (uint8_t*)"NEXT\r\n", 6, 100);
+    if (gesture == G_PREV) HAL_UART_Transmit(&huart2, (uint8_t*)"PREV\r\n", 6, 100);
+    HAL_Delay(5);
+
+    // DEBUG: AFISEAZA DISTANTELE IN UART DACA ORICARE DINTRE ELE ESTE MAI MIC DE DIST_TH
+    // if ((distance[0] && distance[0] < DIST_TH) ||
+    //     (distance[1] && distance[1] < DIST_TH) ||
+    //     (distance[2] && distance[2] < DIST_TH)) {
+    //     int m = snprintf(out, sizeof(out), "L:%u C:%u R:%u\r\n", distance[0], distance[1], distance[2]);
+    //     HAL_UART_Transmit(&huart2, (uint8_t*)out, m, 100);
+    // }
   }
   /* USER CODE END 3 */
 }
